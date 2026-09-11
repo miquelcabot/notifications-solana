@@ -1029,114 +1029,41 @@ fn test_cancel_fails_before_term2_expires() {
 
 const MAX_CU: u64 = 200_000;
 
-#[test]
-fn bench_create_delivery() {
-    let mut svm = setup_svm();
 
-    let sender = Keypair::new();
-    let receiver = Pubkey::new_unique();
-    let nonce = [101u8; 8];
-    fund(&mut svm, &sender.pubkey());
+/// Receiver counts the benchmarks sweep. 10 is `MAX_RECEIVERS`, the program's
+/// own bound, and also the largest count the EVM and Substrate measurements use,
+/// so the three platforms share one grid.
+const BENCH_RECEIVER_COUNTS: [usize; 3] = [1, 2, 10];
 
-    let v = make_scalar(42);
-    let (vx, vy) = point_to_xy(&ProjectivePoint::mul_by_generator(&v));
-
-    let (delivery_key, _) = delivery_pda(&sender.pubkey(), &nonce);
-    let (vault_key, _) = vault_pda(&delivery_key);
-
-    let ix = create_delivery_ix(
-        &sender.pubkey(),
-        &delivery_key,
-        &vault_key,
-        vec![receiver],
-        vx,
-        vy,
-        vec![0u8; 32],
-        vec![1u8; 64],
-        3600,
-        7200,
-        nonce,
-    );
-
-    let metadata = send_tx(&mut svm, &[ix], &sender, &[&sender]);
-    println!(
-        "\n[bench] create_delivery   →  {} CU  (limit {})",
-        metadata.compute_units_consumed, MAX_CU
-    );
-    assert!(
-        metadata.compute_units_consumed <= MAX_CU,
-        "create_delivery used {} CU, exceeds limit {}",
-        metadata.compute_units_consumed,
-        MAX_CU
-    );
+/// Everything a parametrised benchmark needs for `n` receivers.
+struct BenchSetup {
+    svm: LiteSVM,
+    sender: Keypair,
+    receivers: Vec<Keypair>,
+    delivery_key: Pubkey,
+    vault_key: Pubkey,
+    bx: [u8; 32],
+    by: [u8; 32],
+    c_bytes: [u8; 32],
+    r_bytes: [u8; 32],
 }
 
-#[test]
-fn bench_accept() {
+/// Create a delivery addressed to `n` receivers and return the pieces needed to
+/// drive the remaining instructions.
+///
+/// Keeps the deterministic scalars of the original single-receiver benchmarks
+/// (v = 10, b = 20, c = 30, r = v - b·c) so the EC verification in `finish`
+/// succeeds and the measured cost is the honest path.
+fn bench_setup(n: usize, nonce_seed: u8) -> (BenchSetup, u64) {
     let mut svm = setup_svm();
 
     let sender = Keypair::new();
-    let receiver = Keypair::new();
-    let nonce = [102u8; 8];
+    let receivers: Vec<Keypair> = (0..n).map(|_| Keypair::new()).collect();
+    let nonce = [nonce_seed; 8];
     fund(&mut svm, &sender.pubkey());
-    fund(&mut svm, &receiver.pubkey());
-
-    let v = make_scalar(10);
-    let b = make_scalar(20);
-    let c = make_scalar(30);
-    let (vx, vy) = point_to_xy(&ProjectivePoint::mul_by_generator(&v));
-    let (bx, by) = point_to_xy(&ProjectivePoint::mul_by_generator(&b));
-    let c_bytes = scalar_to_bytes(&c);
-
-    let (delivery_key, _) = delivery_pda(&sender.pubkey(), &nonce);
-    let (vault_key, _) = vault_pda(&delivery_key);
-
-    let create_ix = create_delivery_ix(
-        &sender.pubkey(),
-        &delivery_key,
-        &vault_key,
-        vec![receiver.pubkey()],
-        vx,
-        vy,
-        vec![0u8; 32],
-        vec![],
-        3600,
-        7200,
-        nonce,
-    );
-    send_tx(&mut svm, &[create_ix], &sender, &[&sender]);
-
-    let accept = accept_ix(
-        &receiver.pubkey(),
-        &delivery_key,
-        vec![0xAA; 32],
-        vec![0xBB; 32],
-        bx,
-        by,
-        c_bytes,
-    );
-    let metadata = send_tx(&mut svm, &[accept], &receiver, &[&receiver]);
-    println!(
-        "\n[bench] accept             →  {} CU  (limit {})",
-        metadata.compute_units_consumed, MAX_CU
-    );
-    assert!(
-        metadata.compute_units_consumed <= MAX_CU,
-        "accept used {} CU, exceeds limit {}",
-        metadata.compute_units_consumed,
-        MAX_CU
-    );
-}
-
-#[test]
-fn bench_finish() {
-    let mut svm = setup_svm();
-
-    let sender = Keypair::new();
-    let receiver = Keypair::new();
-    let nonce = [103u8; 8];
-    fund(&mut svm, &sender.pubkey());
-    fund(&mut svm, &receiver.pubkey());
+    for r in &receivers {
+        fund(&mut svm, &r.pubkey());
+    }
 
     let v = make_scalar(10);
     let b = make_scalar(20);
@@ -1154,110 +1081,130 @@ fn bench_finish() {
         &sender.pubkey(),
         &delivery_key,
         &vault_key,
-        vec![receiver.pubkey()],
+        receivers.iter().map(|r| r.pubkey()).collect(),
         vx,
         vy,
         vec![0u8; 32],
-        vec![],
+        vec![1u8; 64],
         3600,
         7200,
         nonce,
     );
-    send_tx(&mut svm, &[create_ix], &sender, &[&sender]);
+    let create_cu = send_tx(&mut svm, &[create_ix], &sender, &[&sender]).compute_units_consumed;
 
-    let accept = accept_ix(
-        &receiver.pubkey(),
-        &delivery_key,
-        vec![0xAA; 32],
-        vec![0xBB; 32],
-        bx,
-        by,
-        c_bytes,
-    );
-    send_tx(&mut svm, &[accept], &receiver, &[&receiver]);
+    (
+        BenchSetup { svm, sender, receivers, delivery_key, vault_key, bx, by, c_bytes, r_bytes },
+        create_cu,
+    )
+}
 
-    let finish = finish_ix(
-        &sender.pubkey(),
-        &delivery_key,
-        &vault_key,
-        receiver.pubkey(),
-        r_bytes,
-    );
-    let metadata = send_tx(&mut svm, &[finish], &sender, &[&sender]);
+/// Have every receiver accept. Returns the CU of the *first* acceptance, which is
+/// the per-call figure comparable across receiver counts.
+fn bench_accept_all(s: &mut BenchSetup) -> u64 {
+    let mut first = 0u64;
+    for (i, receiver) in s.receivers.iter().enumerate() {
+        let ix = accept_ix(
+            &receiver.pubkey(),
+            &s.delivery_key,
+            vec![0xAA; 32],
+            vec![0xBB; 32],
+            s.bx,
+            s.by,
+            s.c_bytes,
+        );
+        let cu = send_tx(&mut s.svm, &[ix], receiver, &[receiver]).compute_units_consumed;
+        if i == 0 {
+            first = cu;
+        }
+    }
+    first
+}
+
+/// Repetitions per data point. Each run uses fresh keypairs, so the PDA bump
+/// seeds differ and derivation cost varies by a few hundred CU; without
+/// averaging that noise is large enough to invert adjacent receiver counts.
+const BENCH_REPS: usize = 10;
+
+fn report(op: &str, n: usize, samples: &[u64]) {
+    let mean = samples.iter().sum::<u64>() / samples.len() as u64;
+    let (lo, hi) = (samples.iter().min().unwrap(), samples.iter().max().unwrap());
     println!(
-        "\n[bench] finish (EC verify) →  {} CU  (limit {})",
-        metadata.compute_units_consumed, MAX_CU
+        "[bench] {op:<16} n={n:<3} →  {mean:>6} CU  (min {lo}, max {hi}, {} reps, limit {MAX_CU})",
+        samples.len()
     );
-    assert!(
-        metadata.compute_units_consumed <= MAX_CU,
-        "finish used {} CU, exceeds limit {}",
-        metadata.compute_units_consumed,
-        MAX_CU
-    );
+    assert!(*hi <= MAX_CU, "{op} with {n} receivers used {hi} CU, exceeds limit {MAX_CU}");
+}
+
+#[test]
+fn bench_create_delivery() {
+    println!();
+    for &n in BENCH_RECEIVER_COUNTS.iter() {
+        let samples: Vec<u64> = (0..BENCH_REPS)
+            .map(|k| bench_setup(n, 101 + k as u8).1)
+            .collect();
+        report("create_delivery", n, &samples);
+    }
+}
+
+#[test]
+fn bench_accept() {
+    println!();
+    for &n in BENCH_RECEIVER_COUNTS.iter() {
+        let samples: Vec<u64> = (0..BENCH_REPS)
+            .map(|k| {
+                let (mut s, _) = bench_setup(n, 111 + k as u8);
+                bench_accept_all(&mut s)
+            })
+            .collect();
+        report("accept", n, &samples);
+    }
+}
+
+#[test]
+fn bench_finish() {
+    println!();
+    for &n in BENCH_RECEIVER_COUNTS.iter() {
+        let samples: Vec<u64> = (0..BENCH_REPS)
+            .map(|k| {
+                let (mut s, _) = bench_setup(n, 121 + k as u8);
+                // All receivers accept: worst case for the loop in `finish`, which
+                // walks every entry, and it satisfies the all-accepted guard
+                // without warping the clock.
+                bench_accept_all(&mut s);
+                let ix = finish_ix(
+                    &s.sender.pubkey(),
+                    &s.delivery_key,
+                    &s.vault_key,
+                    s.receivers[0].pubkey(),
+                    s.r_bytes,
+                );
+                send_tx(&mut s.svm, &[ix], &s.sender, &[&s.sender]).compute_units_consumed
+            })
+            .collect();
+        report("finish", n, &samples);
+    }
 }
 
 #[test]
 fn bench_cancel() {
-    let mut svm = setup_svm();
+    println!();
+    for &n in BENCH_RECEIVER_COUNTS.iter() {
+        let samples: Vec<u64> = (0..BENCH_REPS)
+            .map(|k| {
+                let (mut s, _) = bench_setup(n, 131 + k as u8);
+                bench_accept_all(&mut s);
 
-    let sender = Keypair::new();
-    let receiver = Keypair::new();
-    let nonce = [104u8; 8];
-    fund(&mut svm, &sender.pubkey());
-    fund(&mut svm, &receiver.pubkey());
+                let mut clock: Clock = s.svm.get_sysvar();
+                clock.unix_timestamp += 8000;
+                s.svm.set_sysvar(&clock);
 
-    let v = make_scalar(10);
-    let b = make_scalar(20);
-    let c = make_scalar(30);
-    let (vx, vy) = point_to_xy(&ProjectivePoint::mul_by_generator(&v));
-    let (bx, by) = point_to_xy(&ProjectivePoint::mul_by_generator(&b));
-    let c_bytes = scalar_to_bytes(&c);
-
-    let (delivery_key, _) = delivery_pda(&sender.pubkey(), &nonce);
-    let (vault_key, _) = vault_pda(&delivery_key);
-
-    let create_ix = create_delivery_ix(
-        &sender.pubkey(),
-        &delivery_key,
-        &vault_key,
-        vec![receiver.pubkey()],
-        vx,
-        vy,
-        vec![],
-        vec![],
-        3600,
-        7200,
-        nonce,
-    );
-    send_tx(&mut svm, &[create_ix], &sender, &[&sender]);
-
-    let accept = accept_ix(
-        &receiver.pubkey(),
-        &delivery_key,
-        vec![],
-        vec![],
-        bx,
-        by,
-        c_bytes,
-    );
-    send_tx(&mut svm, &[accept], &receiver, &[&receiver]);
-
-    let mut clock: Clock = svm.get_sysvar();
-    clock.unix_timestamp += 8000;
-    svm.set_sysvar(&clock);
-
-    let cancel = cancel_ix(&receiver.pubkey(), &delivery_key);
-    let metadata = send_tx(&mut svm, &[cancel], &receiver, &[&receiver]);
-    println!(
-        "\n[bench] cancel             →  {} CU  (limit {})",
-        metadata.compute_units_consumed, MAX_CU
-    );
-    assert!(
-        metadata.compute_units_consumed <= MAX_CU,
-        "cancel used {} CU, exceeds limit {}",
-        metadata.compute_units_consumed,
-        MAX_CU
-    );
+                let receiver = s.receivers[0].insecure_clone();
+                let ix = cancel_ix(&receiver.pubkey(), &s.delivery_key);
+                send_tx(&mut s.svm, &[ix], &receiver, &[&receiver]).compute_units_consumed
+            })
+            .collect();
+        report("cancel", n, &samples);
+    }
 }
 
 #[test]
