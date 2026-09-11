@@ -1296,3 +1296,97 @@ fn bench_full_delivery_flow() {
         DELIVERY_DEPOSIT as f64 / 1_000_000_000.0
     );
 }
+
+// ===================== Shared cross-implementation vectors =====================
+
+#[path = "shared_vectors.rs"]
+mod shared_vectors;
+
+/// Drive the shared secp256k1 vectors through the real program.
+///
+/// This closes conformance gap F5: the program must reject a wrong `r`, not
+/// merely compute the relation correctly. `test_wrong_r_fails_identity` checks
+/// the arithmetic in the test process; this checks enforcement on-chain.
+#[test]
+fn test_shared_vectors_conformance() {
+    println!();
+    let mut failures = Vec::new();
+
+    for (i, vec) in shared_vectors::VECTORS.iter().enumerate() {
+        let mut svm = setup_svm();
+        let sender = Keypair::new();
+        let receiver = Keypair::new();
+        let nonce = [200u8 + i as u8; 8];
+        fund(&mut svm, &sender.pubkey());
+        fund(&mut svm, &receiver.pubkey());
+
+        let (delivery_key, _) = delivery_pda(&sender.pubkey(), &nonce);
+        let (vault_key, _) = vault_pda(&delivery_key);
+
+        send_tx(
+            &mut svm,
+            &[create_delivery_ix(
+                &sender.pubkey(),
+                &delivery_key,
+                &vault_key,
+                vec![receiver.pubkey()],
+                vec.vx,
+                vec.vy,
+                vec![0u8; 32],
+                vec![1u8; 64],
+                3600,
+                7200,
+                nonce,
+            )],
+            &sender,
+            &[&sender],
+        );
+
+        send_tx(
+            &mut svm,
+            &[accept_ix(
+                &receiver.pubkey(),
+                &delivery_key,
+                vec![0xAA; 32],
+                vec![0xBB; 32],
+                vec.bx,
+                vec.by,
+                vec.c,
+            )],
+            &receiver,
+            &[&receiver],
+        );
+
+        let finish = finish_ix(
+            &sender.pubkey(),
+            &delivery_key,
+            &vault_key,
+            receiver.pubkey(),
+            vec.r,
+        );
+        let blockhash = svm.latest_blockhash();
+        let tx = Transaction::new_signed_with_payer(
+            &[finish],
+            Some(&sender.pubkey()),
+            &[&sender],
+            blockhash,
+        );
+        let accepted = svm.send_transaction(tx).is_ok();
+
+        let verdict = if accepted == vec.valid { "ok  " } else { "FAIL" };
+        println!(
+            "[vectors] {verdict}  {:<32} expected {:<8} got {}",
+            vec.id,
+            if vec.valid { "accepted" } else { "rejected" },
+            if accepted { "accepted" } else { "rejected" }
+        );
+        if accepted != vec.valid {
+            failures.push(vec.id);
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "program does not conform on shared vectors: {failures:?}"
+    );
+}
