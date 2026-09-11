@@ -37,6 +37,7 @@ pub mod solana_notifications {
         term1: i64,
         term2: i64,
         nonce: [u8; 8],
+        vault_bump: u8,
     ) -> Result<()> {
         require!(
             !receivers.is_empty() && receivers.len() <= MAX_RECEIVERS,
@@ -87,7 +88,7 @@ pub mod solana_notifications {
         delivery.accepted_receivers = 0;
         delivery.finished = false;
         delivery.bump = ctx.bumps.delivery;
-        delivery.vault_bump = ctx.bumps.vault;
+        delivery.vault_bump = vault_bump;
         delivery.nonce = nonce;
 
         // Lock deposit in vault PDA
@@ -467,7 +468,8 @@ impl Delivery {
     encrypted_message_hash: Vec<u8>,
     a: Vec<u8>,
     term1: i64, term2: i64,
-    nonce: [u8; 8]
+    nonce: [u8; 8],
+    vault_bump: u8
 )]
 pub struct CreateDelivery<'info> {
     #[account(mut)]
@@ -484,10 +486,18 @@ pub struct CreateDelivery<'info> {
 
     /// CHECK: Vault PDA holding the sender's deposit.
     /// Derived as `["vault", delivery]`; funded via SOL transfer on create.
+    ///
+    /// The bump is supplied by the client. A bare `bump` would make Anchor call
+    /// `find_program_address` on-chain, whose cost varies with the address
+    /// (~1,500 CU per attempt); with a target it calls `create_program_address`
+    /// once and still rejects any bump that does not reproduce this address.
+    /// The `delivery` account above cannot take the same treatment: Anchor
+    /// forbids a bump target on `init` and always searches for the canonical
+    /// bump there.
     #[account(
         mut,
         seeds = [b"vault", delivery.key().as_ref()],
-        bump
+        bump = vault_bump
     )]
     pub vault: AccountInfo<'info>,
 

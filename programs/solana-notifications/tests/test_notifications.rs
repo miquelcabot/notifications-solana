@@ -155,6 +155,7 @@ fn create_delivery_ix(
             term1,
             term2,
             nonce,
+            vault_bump: vault_pda(delivery).1,
         }
         .data(),
         accounts::CreateDelivery {
