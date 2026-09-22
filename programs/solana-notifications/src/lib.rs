@@ -137,6 +137,16 @@ pub mod solana_notifications {
     ) -> Result<()> {
         require!(z1.len() <= MAX_Z1_SIZE, SolanaNotificationsError::InvalidZ1);
         require!(z2.len() <= MAX_Z2_SIZE, SolanaNotificationsError::InvalidZ2);
+        // A transcript that finish() could never verify would lock the sender's
+        // deposit for good, so it is refused here: B must be a curve point whose
+        // x is a valid signature 'r' (< n), and c a non-zero scalar (see
+        // verify_cryptographic_proof). Same guard as the EVM and Substrate ones.
+        require_on_curve(&bx, &by)?;
+        bytes_to_scalar(&bx)?;
+        require!(
+            !bool::from(bytes_to_scalar(&c)?.is_zero()),
+            SolanaNotificationsError::InvalidScalar
+        );
 
         let delivery = &mut ctx.accounts.delivery;
         let receiver_key = ctx.accounts.receiver.key();
@@ -382,6 +392,16 @@ fn verify_cryptographic_proof(
     Ok(())
 }
 
+/// Rejects (x, y) unless it is a point of secp256k1 (y^2 == x^3 + 7 in the
+/// base field). Pure field arithmetic, no point operations.
+fn require_on_curve(x: &[u8; 32], y: &[u8; 32]) -> Result<()> {
+    use k256::elliptic_curve::sec1::FromEncodedPoint;
+    let encoded = k256::EncodedPoint::from_affine_coordinates(x.into(), y.into(), false);
+    let point: Option<k256::AffinePoint> = k256::AffinePoint::from_encoded_point(&encoded).into();
+    require!(point.is_some(), SolanaNotificationsError::InvalidScalar);
+    Ok(())
+}
+
 fn bytes_to_scalar(bytes: &[u8; 32]) -> Result<k256::Scalar> {
     use k256::elliptic_curve::ScalarPrimitive;
     let prim = ScalarPrimitive::from_slice(bytes)
@@ -620,7 +640,7 @@ pub enum SolanaNotificationsError {
     CancelWindowNotReached,
     #[msg("Unauthorized: caller is not the delivery sender")]
     Unauthorized,
-    #[msg("Invalid scalar: bytes could not be decoded as a secp256k1 scalar")]
+    #[msg("Invalid scalar or point: not in [1, n-1] or not a point of secp256k1")]
     InvalidScalar,
     #[msg("Invalid point: bytes could not be decoded as a secp256k1 affine point")]
     InvalidPoint,

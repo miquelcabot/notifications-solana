@@ -914,6 +914,48 @@ fn test_finish_fails_when_already_finished() {
     send_tx_expect_err(&mut svm, &[finish2], &sender, &[&sender]);
 }
 
+// Not a row of the conformance matrix: guards the recovery-based verification,
+// which can never verify a B off the curve or a zero challenge; accepting such a
+// transcript would lock the sender's deposit. Same guard as the EVM and Substrate ones.
+#[test]
+fn test_accept_refuses_a_transcript_finish_could_not_verify() {
+    let mut svm = setup_svm();
+
+    let sender = Keypair::new();
+    let receiver = Keypair::new();
+    let nonce = [18u8; 8];
+    fund(&mut svm, &sender.pubkey());
+    fund(&mut svm, &receiver.pubkey());
+
+    let v = make_scalar(42);
+    let b = make_scalar(20);
+    let (vx, vy) = point_to_xy(&ProjectivePoint::mul_by_generator(&v));
+    let (bx, by) = point_to_xy(&ProjectivePoint::mul_by_generator(&b));
+    let c_bytes = scalar_to_bytes(&make_scalar(30));
+
+    let (delivery_key, _) = delivery_pda(&sender.pubkey(), &nonce);
+    let (vault_key, _) = vault_pda(&delivery_key);
+    let create_ix = create_delivery_ix(
+        &sender.pubkey(), &delivery_key, &vault_key, vec![receiver.pubkey()],
+        vx, vy, vec![], vec![], 3600, 7200, nonce,
+    );
+    send_tx(&mut svm, &[create_ix], &sender, &[&sender]);
+
+    // B off the curve
+    let mut by_bad = by;
+    by_bad[31] ^= 1;
+    let ix = accept_ix(&receiver.pubkey(), &delivery_key, vec![], vec![], bx, by_bad, c_bytes);
+    send_tx_expect_err(&mut svm, &[ix], &receiver, &[&receiver]);
+
+    // c = 0
+    let ix = accept_ix(&receiver.pubkey(), &delivery_key, vec![], vec![], bx, by, [0u8; 32]);
+    send_tx_expect_err(&mut svm, &[ix], &receiver, &[&receiver]);
+
+    // the honest transcript still goes through
+    let ix = accept_ix(&receiver.pubkey(), &delivery_key, vec![], vec![], bx, by, c_bytes);
+    send_tx(&mut svm, &[ix], &receiver, &[&receiver]);
+}
+
 #[test]
 fn test_accept_fails_after_term1_expires() {
     let mut svm = setup_svm();
